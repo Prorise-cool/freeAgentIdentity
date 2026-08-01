@@ -15,6 +15,7 @@ _TEST_DB_PATH = _tmp.name
 os.environ["ACCOUNT_MANAGER_DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 
 import pytest
+from sqlalchemy import text
 from sqlmodel import SQLModel, create_engine
 
 # Patch the engine before the app is created
@@ -29,15 +30,20 @@ _db_module.engine = create_engine(
 
 @pytest.fixture(autouse=True)
 def _reset_db():
-    """Drop and recreate all tables between tests for full isolation."""
+    """每个测试前删除并重建所有数据表，保证测试完全隔离。"""
+    with _db_module.engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS producer_deliveries"))
     SQLModel.metadata.drop_all(_db_module.engine)
     SQLModel.metadata.create_all(_db_module.engine)
     yield
 
 
 @pytest.fixture()
-def client():
-    """FastAPI TestClient with a clean database."""
+def client(monkeypatch):
+    """创建使用干净测试数据库且不启动 Solver 的 FastAPI 客户端。"""
+    from services import solver_manager
+
+    monkeypatch.setattr(solver_manager, "start_async", lambda: None)
     from main import app
 
     with TestClient(app, raise_server_exceptions=False) as c:

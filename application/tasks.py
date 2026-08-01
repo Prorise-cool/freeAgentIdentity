@@ -22,6 +22,7 @@ from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_accoun
 from core.platform_accounts import build_platform_account
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
+from infrastructure.producer_queue import enqueue_account
 
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
@@ -727,6 +728,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             account = platform.register(email=email, password=password)
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
+            enqueue_account(saved_account_id)
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
             if sub2api_upload_config:

@@ -71,10 +71,12 @@ from api.health import router as health_router
 from api.platforms import router as platforms_router
 from api.provider_definitions import router as provider_definitions_router
 from api.provider_settings import router as provider_settings_router
+from api.producer import router as producer_router
 from api.system import router as system_router
 from api.task_commands import router as task_commands_router
 from api.tasks import router as tasks_router
 from core.db import init_db
+from infrastructure.producer_queue import init_producer_queue
 from core.registry import load_all
 from providers.registry import load_all as load_providers
 
@@ -82,6 +84,7 @@ from providers.registry import load_all as load_providers
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_producer_queue()
     load_all()
     load_providers()
     print("[OK] 数据库初始化完成")
@@ -125,6 +128,7 @@ app.include_router(health_router, prefix="/api")
 app.include_router(platforms_router, prefix="/api")
 app.include_router(provider_definitions_router, prefix="/api")
 app.include_router(provider_settings_router, prefix="/api")
+app.include_router(producer_router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
 app.include_router(task_commands_router, prefix="/api")
 app.include_router(system_router, prefix="/api")

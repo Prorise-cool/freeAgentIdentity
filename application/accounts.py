@@ -14,6 +14,7 @@ from domain.accounts import (
     AccountUpdateCommand,
 )
 from infrastructure.accounts_repository import AccountsRepository
+from infrastructure.producer_queue import enqueue_account
 
 
 IMPORT_LINE_RE = re.compile(
@@ -55,7 +56,10 @@ class AccountsService:
         return self._serialize(item) if item else None
 
     def update_account(self, account_id: int, command: AccountUpdateCommand) -> dict | None:
+        """更新账号；ChatGPT 凭据版本变化时同步唤醒生产队列。"""
         item = self.repository.update(account_id, command)
+        if item and item.platform == "chatgpt":
+            enqueue_account(item.id)
         return self._serialize(item) if item else None
 
     def delete_account(self, account_id: int) -> dict:

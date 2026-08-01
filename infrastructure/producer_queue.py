@@ -1,6 +1,9 @@
 """向下游提供 ChatGPT 账号的持久生产队列。"""
 from __future__ import annotations
 
+import ast
+import base64
+import hashlib
 import json
 import threading
 import uuid
@@ -31,8 +34,22 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    """解码 JWT payload；格式无效时返回空对象。"""
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) != 3:
+            return {}
+        encoded = parts[1].replace("-", "+").replace("_", "/")
+        encoded += "=" * ((4 - len(encoded) % 4) % 4)
+        payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _cookie_header(value: Any) -> str:
-    """把字典或 JSON cookies 转为标准 Cookie 请求头。"""
+    """把字典、JSON 或旧 Python repr cookies 转为标准 Cookie 请求头。"""
     if isinstance(value, dict):
         return "; ".join(f"{key}={item}" for key, item in value.items() if key and item is not None)
     raw = str(value or "").strip()
@@ -41,10 +58,23 @@ def _cookie_header(value: Any) -> str:
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
-        return raw
+        try:
+            parsed = ast.literal_eval(raw)
+        except (SyntaxError, ValueError):
+            return raw
     if not isinstance(parsed, dict):
         return raw
     return "; ".join(f"{key}={item}" for key, item in parsed.items() if key and item is not None)
+
+
+def _ensure_queue_column(connection: Any, name: str, definition: str) -> None:
+    """为已有 SQLite 生产队列表补充缺失字段。"""
+    columns = {
+        str(row[1])
+        for row in connection.execute(text("PRAGMA table_info(producer_deliveries)")).fetchall()
+    }
+    if name not in columns:
+        connection.execute(text(f"ALTER TABLE producer_deliveries ADD COLUMN {name} {definition}"))
 
 
 def init_producer_queue() -> None:
@@ -59,6 +89,8 @@ def init_producer_queue() -> None:
                 consumer_id TEXT NOT NULL DEFAULT '',
                 lease_expires_at TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
+                credential_revision TEXT NOT NULL DEFAULT '',
+                acked_lease_id TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -66,6 +98,8 @@ def init_producer_queue() -> None:
                 FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             )
         """))
+        _ensure_queue_column(connection, "credential_revision", "TEXT NOT NULL DEFAULT ''")
+        _ensure_queue_column(connection, "acked_lease_id", "TEXT NOT NULL DEFAULT ''")
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_producer_deliveries_state ON producer_deliveries(state, account_id)"
         ))
@@ -88,23 +122,48 @@ def init_producer_queue() -> None:
 
 
 def enqueue_account(account_id: int) -> None:
-    """注册成功或凭据刷新后，把账号重新置为可领取。"""
+    """注册成功或凭据刷新后，仅在凭据版本变化时重新开放投递。"""
     safe_id = int(account_id or 0)
     if safe_id <= 0:
         raise ValueError("账号 ID 无效")
     init_producer_queue()
     now = _iso(_now())
+    try:
+        revision = str(_delivery_payload(safe_id)["credential_revision"])
+    except ValueError as exc:
+        with _QUEUE_LOCK, engine.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO producer_deliveries
+                        (account_id, state, created_at, updated_at, last_error)
+                    VALUES (:account_id, 'blocked', :now, :now, :error)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        state = 'blocked', lease_id = '', consumer_id = '',
+                        lease_expires_at = NULL, acked_lease_id = '',
+                        last_error = excluded.last_error, updated_at = excluded.updated_at
+                """),
+                {"account_id": safe_id, "now": now, "error": str(exc)[:500]},
+            )
+        return
     with _QUEUE_LOCK, engine.begin() as connection:
+        current = connection.execute(
+            text("SELECT state, credential_revision FROM producer_deliveries WHERE account_id = :account_id"),
+            {"account_id": safe_id},
+        ).mappings().first()
+        if current and str(current["credential_revision"] or "") == revision and current["state"] != "blocked":
+            return
         connection.execute(
             text("""
-                INSERT INTO producer_deliveries (account_id, state, created_at, updated_at)
-                VALUES (:account_id, 'available', :now, :now)
+                INSERT INTO producer_deliveries
+                    (account_id, state, credential_revision, created_at, updated_at)
+                VALUES (:account_id, 'available', :revision, :now, :now)
                 ON CONFLICT(account_id) DO UPDATE SET
                     state = 'available', lease_id = '', consumer_id = '',
-                    lease_expires_at = NULL, last_error = '', acked_at = NULL,
+                    lease_expires_at = NULL, credential_revision = excluded.credential_revision,
+                    acked_lease_id = '', last_error = '', acked_at = NULL,
                     updated_at = excluded.updated_at
             """),
-            {"account_id": safe_id, "now": now},
+            {"account_id": safe_id, "revision": revision, "now": now},
         )
 
 
@@ -143,16 +202,59 @@ def inventory() -> dict[str, Any]:
 
 
 def _delivery_payload(account_id: int) -> dict[str, Any]:
-    """把内部账号记录转换为稳定的生产 API 凭据格式。"""
+    """校验账号状态和令牌后，转换为稳定的生产 API 凭据格式。"""
     record = AccountsRepository().get(account_id)
     if record is None or record.platform != "chatgpt":
         raise ValueError("ChatGPT 账号不存在")
+    if record.lifecycle_status in {"invalid", "expired", "deleted", "disabled", "cancelled", "canceled"}:
+        raise ValueError(f"账号生命周期不可投递: {record.lifecycle_status}")
+    if record.validity_status == "invalid":
+        raise ValueError("账号有效性检测为 invalid")
     payload = _chatgpt_export_payload(record)
+    email = str(payload.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        raise ValueError("缺少有效 email")
     access_token = str(payload.get("access_token") or "").strip()
     if not access_token:
         raise ValueError("缺少 access_token")
-    cookie_header = _cookie_header(payload.get("cookies"))
+    claims = _decode_jwt_payload(access_token)
+    if not claims:
+        raise ValueError("access_token 不是有效 JWT")
+    expires_at = int(claims.get("exp") or 0)
+    if expires_at <= int(_now().timestamp()) + 60:
+        raise ValueError("access_token 已过期或即将过期")
+    auth = claims.get("https://api.openai.com/auth")
+    profile = claims.get("https://api.openai.com/profile")
+    auth = auth if isinstance(auth, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    token_email = str(profile.get("email") or claims.get("email") or "").strip().lower()
+    if token_email and token_email != email:
+        raise ValueError("access_token 邮箱与账号记录不一致")
     account_id_value = str(payload.get("account_id") or "").strip()
+    if not account_id_value:
+        raise ValueError("缺少 account_id")
+    token_account_id = str(
+        auth.get("chatgpt_account_id")
+        or auth.get("account_id")
+        or claims.get("chatgpt_account_id")
+        or claims.get("account_id")
+        or ""
+    ).strip()
+    if token_account_id and token_account_id != account_id_value:
+        raise ValueError("access_token account_id 与账号记录不一致")
+    cookie_header = _cookie_header(payload.get("cookies"))
+    revision_source = json.dumps(
+        {
+            "email": email,
+            "account_id": account_id_value,
+            "access_token": access_token,
+            "refresh_token": str(payload.get("refresh_token") or ""),
+            "session_token": str(payload.get("session_token") or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    credential_revision = hashlib.sha256(revision_source.encode("utf-8")).hexdigest()
     raw_session: dict[str, Any] = {
         "accessToken": access_token,
         "sessionToken": str(payload.get("session_token") or ""),
@@ -163,7 +265,8 @@ def _delivery_payload(account_id: int) -> dict[str, Any]:
     return {
         "delivery_id": account_id,
         "producer_account_id": account_id,
-        "email": str(payload.get("email") or "").strip().lower(),
+        "producer_namespace": "freeagent",
+        "email": email,
         "password": str(payload.get("password") or ""),
         "account_id": account_id_value,
         "access_token": access_token,
@@ -173,6 +276,8 @@ def _delivery_payload(account_id: int) -> dict[str, Any]:
         "cookie_header": cookie_header,
         "raw_session": raw_session,
         "credential_source": "freeagent_producer",
+        "credential_revision": credential_revision,
+        "token_expires_at": expires_at,
     }
 
 
@@ -219,7 +324,8 @@ def lease_accounts(consumer_id: str, limit: int, lease_seconds: int) -> dict[str
                     UPDATE producer_deliveries
                     SET state = 'leased', lease_id = :lease_id, consumer_id = :consumer_id,
                         lease_expires_at = :expires_at, attempts = attempts + 1,
-                        last_error = '', updated_at = :now
+                        credential_revision = :credential_revision,
+                        acked_lease_id = '', last_error = '', updated_at = :now
                     WHERE account_id = :account_id AND state = 'available'
                 """),
                 {
@@ -227,6 +333,7 @@ def lease_accounts(consumer_id: str, limit: int, lease_seconds: int) -> dict[str
                     "lease_id": lease_id,
                     "consumer_id": safe_consumer,
                     "expires_at": expires_at,
+                    "credential_revision": item["credential_revision"],
                     "now": now,
                 },
             )
@@ -238,7 +345,7 @@ def lease_accounts(consumer_id: str, limit: int, lease_seconds: int) -> dict[str
 
 
 def _finish_lease(lease_id: str, delivery_ids: list[int], *, ack: bool, reason: str = "") -> dict[str, int]:
-    """严格确认或释放指定租约条目，拒绝部分静默成功。"""
+    """带过期 fencing 确认或释放租约；确认请求支持安全重放。"""
     safe_lease = str(lease_id or "").strip()
     ids = list(dict.fromkeys(int(value) for value in delivery_ids if int(value) > 0))
     if not safe_lease or not ids:
@@ -247,19 +354,33 @@ def _finish_lease(lease_id: str, delivery_ids: list[int], *, ack: bool, reason: 
     target_state = "acked" if ack else "available"
     changed = 0
     with _QUEUE_LOCK, engine.begin() as connection:
+        _reclaim_expired(connection, now)
         for account_id in ids:
+            current = connection.execute(
+                text("""
+                    SELECT state, lease_id, lease_expires_at, acked_lease_id
+                    FROM producer_deliveries WHERE account_id = :account_id
+                """),
+                {"account_id": account_id},
+            ).mappings().first()
+            if ack and current and current["state"] == "acked" and current["acked_lease_id"] == safe_lease:
+                changed += 1
+                continue
             result = connection.execute(
                 text("""
                     UPDATE producer_deliveries
                     SET state = :target_state, lease_id = '', consumer_id = '',
                         lease_expires_at = NULL, last_error = :last_error,
+                        acked_lease_id = :acked_lease_id,
                         acked_at = :acked_at, updated_at = :now
-                    WHERE account_id = :account_id AND state = 'leased' AND lease_id = :lease_id
+                    WHERE account_id = :account_id AND state = 'leased'
+                      AND lease_id = :lease_id AND lease_expires_at > :now
                 """),
                 {
                     "target_state": target_state,
                     "last_error": "" if ack else str(reason or "消费失败")[:500],
                     "acked_at": now if ack else None,
+                    "acked_lease_id": safe_lease if ack else "",
                     "now": now,
                     "account_id": account_id,
                     "lease_id": safe_lease,

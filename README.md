@@ -100,16 +100,31 @@ npm run dev
 ### Docker
 
 ```bash
+cp .env.example .env
+# 修改 .env 中以下两个必填且不同的随机密钥：
+# FREEAGENT_APP_PASSWORD
+# FREEAGENT_PRODUCER_API_KEY
 docker compose up -d --build
 ```
 
-默认 Web UI 端口为 `8000`。如果部署到公网，请务必设置访问密码。
+默认 Web UI 和生产 API 端口为 `8000`。Compose 强制要求管理密码和独立生产 API 密钥，注册数据通过 `./data` 持久化，因此本项目可以独立于 TeamAuto 部署和重启。
+
+生产接口使用请求头 `X-Producer-Key`，提供库存、租赁、确认和释放四类操作：
+
+```text
+GET  /api/producer/inventory
+POST /api/producer/leases
+POST /api/producer/leases/{lease_id}/ack
+POST /api/producer/leases/{lease_id}/release
+```
+
+生产者只交付身份完整且 JWT 未过期的 ChatGPT 账号；未确认租约会在超时后自动回收。`FREEAGENT_PRODUCER_API_KEY` 必须与 TeamAuto 的 `TEAMAUTO_FREEAGENT_API_KEY` 完全一致。
 
 ## 配置说明
 
 常用配置优先在 `设置` 页面完成；也可以按需复制 `.env.example` 为 `.env`，通过环境变量覆盖后端默认值。
 
-公网或多人环境建议至少配置：
+非 Compose 启动的公网或多人环境建议至少配置：
 
 ```env
 APP_PASSWORD=change-me
